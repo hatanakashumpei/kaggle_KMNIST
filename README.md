@@ -1,0 +1,2 @@
+# kaggle_KMNIST
+KMNISTのKaggleコンペ
