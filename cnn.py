@@ -9,6 +9,7 @@ CNNを用いて実装する
 
 # modules
 
+import time
 import os
 import random
 
@@ -19,6 +20,7 @@ import cv2
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from sklearn.model_selection import KFold
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
@@ -26,11 +28,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 from tqdm import tqdm
 
 from IPython.display import FileLink
+
+from torchvision.models import resnet18
+import pytorch_lightning as pl
+from pytorch_lightning.core.decorators import auto_move_data
+
+# import EarlyStopping
+import early_stopping_pytorch
 
 
 def seed_everything(seed=42):
@@ -72,10 +82,11 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 PARAMS = {
     'valid_size': 0.2,
     'batch_size': 64,
-    'epochs': 5,
+    'epochs': 100,
     'lr': 0.001,
     'valid_batch_size': 256,
     'test_batch_size': 256,
+    'patience': 20
 }
 
 
@@ -116,68 +127,42 @@ class KMNISTDataset(Dataset):
         return image, label
 
 
-class Net(nn.Module):
-    """モデルを定義する
-    ここではCNNで実装する
+class ResNetKMNIST(pl.LightningModule):
+    """ResNetのモデルを作成する
+    [引用したサイト]
+    https://github.com/marrrcin/pytorch-resnet-mnist
+
     """
     def __init__(self):
-        super(Net, self).__init__()
-        # 出力チャンネル数6, kernel size 5のCNNを定義する
-        # 畳み込みの定義はPytorchの場合torch.nn.Conv2dで行います。ヒント:白黒画像とはチャネル数いくつかは自分で考えよう
-        # 公式documentで使い方を確認する力をつけてほしいので、自分でconv2dなどの使い方は調べよう
-        self.conv1 = nn.Conv2d(1, 6, 5)
-        # 出力チャネル数12, kernel_size 3のCNNを定義する 上記と同様に今度は自分で書いてみよう
-        self.conv2 = nn.Conv2d(6, 12, 3)
+        super().__init__()
+        self.model = resnet18(num_classes=10)
+        self.model.conv1 = nn.Conv2d(
+                                1,
+                                64,
+                                kernel_size=(7, 7),
+                                stride=(2, 2),
+                                padding=(3, 3),
+                                bias=False
+                            )
+        self.loss = nn.CrossEntropyLoss()
 
-        # Maxpoolingの定義(fowardでするのでもどっちでも)
-        self.maxpool = nn.MaxPool2d(2, stride=2)
-
-        # Linearの定義
-        # 線形変換を行う層を定義してあげます: y = Wx + b
-        # self.conv1, conv2のあと，maxpoolingを通すことで，
-        # self.fc1に入力されるTensorの次元は何になっているか計算してみよう！
-        # これを10クラス分類なので，10次元に変換するようなLinear層を定義します
-
-        self.fc1 = nn.Linear(12 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
-
+    @auto_move_data
     def forward(self, x):
-        batch_size = x.shape[0]
-        # forward関数の中では，，入力 x を順番にレイヤーに通していきます．みていきましょう
-        # まずは，画像をCNNに通します
-        x = self.conv1(x)
+        return self.model(x)
 
-        # 活性化関数としてreluを使います
-        x = F.relu(x)
+    def training_step(self, batch, batch_no):
+        x, y = batch
+        logits = self(x)
+        loss = self.loss(logits, y)
+        return loss
 
-        # 次に，MaxPoolingをかけます．
-        x = self.maxpool(x)
-
-        # 2つ目のConv層に通します
-        x = self.conv2(x)
-
-        # MaxPoolingをかけます
-        x = self.maxpool(x)
-
-        # 少しトリッキーなことが起きます．
-        # CNNの出力結果を fully-connected layer に入力するために
-        # 1次元のベクトルにしてやる必要があります
-        # 正確には，　(batch_size, channel, height, width)
-        # --> (batch_size, channel * height * width)
-        x = x.view(batch_size, -1)
-
-        # linearと活性化関数に通します
-        x = self.fc1(x)
-        x = self.fc2(x)
-        x = self.fc3(x)
-
-        x = F.relu(x)
-        return x
+    def configure_optimizers(self):
+        return torch.optim.RMSprop(self.parameters(), lr=0.005)
 
 
 def split_train_dataset(input_train_df):
     """訓練データをtrainとvalidに分割する
+    K-Foldを用いる(https://naokiwifruit.com/2019/12/10/how-to-select-fold-cross-validation/)
 
     Returns:
         df: train_df, valid_df
@@ -194,6 +179,7 @@ def split_train_dataset(input_train_df):
 
 def make_train_dataset(train_df, valid_df):
     """train用のDatasetを作成する
+引用していない run_train() で訓練データを使って訓練しています。 k の値は spl
     """
     transform = transforms.Compose([
                     transforms.ToTensor(),
@@ -232,6 +218,7 @@ def make_train_dataset(train_df, valid_df):
 
 def make_test_dataset():
     """テストデータのDatasetを作成する
+
     """
     transform = transforms.Compose([
                     transforms.ToTensor(),
@@ -264,18 +251,66 @@ def accuracy_score_torch(y_pred, y):
     return accuracy_score(y_pred, y)
 
 
+def plot_graph(
+                values1, values2, rng, label1, label2,
+                valid_loss, title, filename
+            ):
+    """平均損失／平均正解率をグラフにプロットする
+
+    """
+    plt.figure()
+    plt.plot(range(rng), values1, label=label1)
+    plt.plot(range(rng), values2, label=label2)
+
+    # find position of lowest validation loss
+    minposs = valid_loss.index(min(valid_loss))+1
+    plt.axvline(
+            minposs,
+            linestyle='--',
+            color='r',
+            label='Early Stopping Checkpoint'
+        )
+
+    plt.legend()
+    # plt.grid()
+    plt.title(title)
+    plt.savefig(filename)
+
+
 def main(train_dataloader, valid_dataloader, test_dataloader):
     """学習し、モデルの予測を行う
         ここはあとでクラスで書くべきである...
     """
-    model = Net().to(DEVICE)
+    model = ResNetKMNIST().to(DEVICE)
+
+    # 学習結果の保存用
+    history = {
+        'train_loss_values': [],
+        'train_accuracy_values': [],
+        'valid_loss_values': [],
+        'valid_accuracy_values': []
+    }
 
     optim = Adam(model.parameters(), lr=PARAMS['lr'])
+    # LambdaLRを用いて学習率を変化させる
+    # [参考](https://katsura-jp.hatenablog.com/entry/2019/01/30/183501)
+    scheduler = LambdaLR(optim, lr_lambda=lambda epoch: 0.95 ** epoch)
     criterion = nn.CrossEntropyLoss()
 
+    # initialize the early_stopping object
+    # early stopping patience; how long to wait
+    # after last time validation loss improved.
+    early_stopping = early_stopping_pytorch.pytorchtools.EarlyStopping(
+                    patience=PARAMS['patience'],
+                    verbose=True
+                    )
+
     # 学習
+    last_epoch = 0
     for epoch in range(PARAMS['epochs']):
         # epochループを回す
+        start_time = time.time()
+
         model.train()
         train_loss_list = []
         train_accuracy_list = []
@@ -313,15 +348,41 @@ def main(train_dataloader, valid_dataloader, test_dataloader):
             valid_loss_list.append(loss.item())
             valid_accuracy_list.append(accuracy_score_torch(y_pred, y))
 
+        secs = int(time.time() - start_time)
+        mins = secs / 60
+        secs = secs % 60
+
         print(
-            'epoch: {}/{} - loss: {:.5f} - accuracy: {:.3f} - val_loss: {:.5f} - val_accuracy: {:.3f}'.format(
-                epoch,
-                PARAMS['epochs'],
-                np.mean(train_loss_list),
-                np.mean(train_accuracy_list),
-                np.mean(valid_loss_list),
-                np.mean(valid_accuracy_list)
-            ))
+            'Epoch: %d / %d' % (epoch + 1, PARAMS['epochs']),
+            " | time in %d minutes, %d seconds" % (mins, secs)
+        )
+        print('\tLoss: {:.4f}(train)\t|\tAcc: {:.1f}%(train)'.format(
+            np.mean(train_loss_list),
+            np.mean(train_accuracy_list) * 100
+        ))
+        print('\tLoss: {:.4f}(valid)\t|\tAcc: {:.1f}%(valid)'.format(
+            np.mean(valid_loss_list),
+            np.mean(valid_accuracy_list) * 100
+        ))
+
+        history['train_loss_values'].append(np.mean(train_loss_list))
+        history['train_accuracy_values'].append(np.mean(train_accuracy_list))
+        history['valid_loss_values'].append(np.mean(valid_loss_list))
+        history['valid_accuracy_values'].append(np.mean(valid_accuracy_list))
+
+        # early_stopping needs the validation loss to check if it has decresed,
+        # and if it has, it will make a checkpoint of the current model
+        early_stopping(np.mean(valid_loss_list), model)
+        last_epoch += 1
+
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
+
+        # 学習率を更新
+        scheduler.step()
+        # load the last checkpoint with the best model
+        model.load_state_dict(torch.load('checkpoint.pt'))
 
     # モデルの予測
     model.eval()
@@ -347,6 +408,37 @@ def main(train_dataloader, valid_dataloader, test_dataloader):
     sns.countplot(x=TARGET, data=sample_submission_df)
     plt.title('test prediction label distribution')
     plt.savefig('test_prediction_label_distribution.jpg')
+
+    # lossとaccuracy
+    t_losses = history['train_loss_values']
+    t_accus = history['train_accuracy_values']
+    v_losses = history['valid_loss_values']
+    v_accus = history['valid_accuracy_values']
+    title_loss = 'loss'
+    title_accuracy = 'accuracy'
+    filename_loss = 'loss.jpg'
+    filename_accuracy = 'accuracy.jpg'
+
+    plot_graph(
+        t_losses,
+        v_losses,
+        last_epoch,
+        'loss(train)',
+        'loss(validate)',
+        v_losses,
+        title_loss,
+        filename_loss
+    )
+    plot_graph(
+        t_accus,
+        v_accus,
+        last_epoch,
+        'accuracy(train)',
+        'accuracy(validate)',
+        v_losses,
+        title_accuracy,
+        filename_accuracy
+    )
 
 
 if __name__ == '__main__':
