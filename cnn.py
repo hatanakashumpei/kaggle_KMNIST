@@ -83,11 +83,11 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 PARAMS = {
     'valid_size': 0.2,
     'batch_size': 64,
-    'epochs': 5,
+    'epochs': 20,
     'lr': 0.001,
     'valid_batch_size': 256,
     'test_batch_size': 256,
-    'patience': 10
+    'patience': 7
 }
 
 
@@ -261,32 +261,6 @@ def accuracy_score_torch(y_pred, y):
     return accuracy_score(y_pred, y)
 
 
-def plot_graph(
-                values1, values2, rng, label1, label2,
-                valid_loss, title, filename
-            ):
-    """平均損失／平均正解率をグラフにプロットする
-
-    """
-    plt.figure()
-    plt.plot(range(rng), values1, label=label1)
-    plt.plot(range(rng), values2, label=label2)
-
-    # find position of lowest validation loss
-    minposs = valid_loss.index(min(valid_loss))+1
-    plt.axvline(
-            minposs,
-            linestyle='--',
-            color='r',
-            label='Early Stopping Checkpoint'
-        )
-
-    plt.legend()
-    # plt.grid()
-    plt.title(title)
-    plt.savefig(filename)
-
-
 def train(model, train_loader):
     """
     学習
@@ -342,6 +316,7 @@ def eval(model, test_loader):
     """
     testデータの予測
     """
+    print("========evaluate========")
     model.load_state_dict(torch.load('checkpoint.pt'))
     model.eval()
     predictions = []
@@ -366,38 +341,7 @@ def eval(model, test_loader):
     plt.title('test prediction label distribution')
     plt.savefig('test_prediction_label_distribution.jpg')
 
-
-def main(train_dataloader, valid_dataloader, test_dataloader):
-    # lossとaccuracy
-    t_losses = history['train_loss_values']
-    t_accus = history['train_accuracy_values']
-    v_losses = history['valid_loss_values']
-    v_accus = history['valid_accuracy_values']
-    title_loss = 'loss'
-    title_accuracy = 'accuracy'
-    filename_loss = 'loss.jpg'
-    filename_accuracy = 'accuracy.jpg'
-
-    plot_graph(
-        t_losses,
-        v_losses,
-        last_epoch,
-        'loss(train)',
-        'loss(validate)',
-        v_losses,
-        title_loss,
-        filename_loss
-    )
-    plot_graph(
-        t_accus,
-        v_accus,
-        last_epoch,
-        'accuracy(train)',
-        'accuracy(validate)',
-        v_losses,
-        title_accuracy,
-        filename_accuracy
-    )
+    print("Done")
 
 
 if __name__ == '__main__':
@@ -414,30 +358,22 @@ if __name__ == '__main__':
     dataset = make_kflod_train_dataset(TrainDfBefore)
 
     fold = KFold(n_splits=5, shuffle=True, random_state=SEED)
-    # 学習結果の保存用
-    history = {
-        'train_loss_values': [],
-        'train_accuracy_values': [],
-        'valid_loss_values': [],
-        'valid_accuracy_values': []
-    }
 
     cv = 0
     indexs = fold.split(np.arange(len(TrainDfBefore)))
-    model = None
+    # modelの呼び出し
+    model = ResNetKMNIST().to(DEVICE)
+    # initialize the early_stopping object
+    # early stopping patience; how long to wait
+    # after last time validation loss improved.
+    early_stopping = early_stopping_pytorch.pytorchtools.EarlyStopping(
+                    patience=PARAMS['patience'],
+                    verbose=True
+                    )
+
     for fold_idx, (train_idx, valid_idx) in enumerate(indexs):
         print('======================================')
-        print('fold {}'.format(fold_idx))
-
-        model = ResNetKMNIST().to(DEVICE)
-
-        # 学習結果の保存用
-        history = {
-            'train_loss_values': [],
-            'train_accuracy_values': [],
-            'valid_loss_values': [],
-            'valid_accuracy_values': []
-        }
+        print('fold {}'.format(fold_idx + 1))
 
         optim = Adam(model.parameters(), lr=PARAMS['lr'])
         # LambdaLRを用いて学習率を変化させる
@@ -445,17 +381,11 @@ if __name__ == '__main__':
         scheduler = LambdaLR(optim, lr_lambda=lambda epoch: 0.95 ** epoch)
         criterion = nn.CrossEntropyLoss()
 
-        # initialize the early_stopping object
-        # early stopping patience; how long to wait
-        # after last time validation loss improved.
-        early_stopping = early_stopping_pytorch.pytorchtools.EarlyStopping(
-                        patience=PARAMS['patience'],
-                        verbose=True
-                        )
         train_loader = DataLoader(Subset(dataset, train_idx), shuffle=True, batch_size=PARAMS['batch_size'])
         valid_loader = DataLoader(Subset(dataset, valid_idx), shuffle=True, batch_size=PARAMS['valid_batch_size'])
 
-        last_epoch = 0
+        early_stopping.counter = 0
+        early_stopping.early_stop = False
         for epoch_idx in range(PARAMS['epochs']):
             # epochループを回す
             start_time = time.time()
@@ -480,15 +410,9 @@ if __name__ == '__main__':
                 valid_acc * 100
             ))
 
-            history['train_loss_values'].append(train_loss)
-            history['train_accuracy_values'].append(train_acc)
-            history['valid_loss_values'].append(valid_loss)
-            history['valid_accuracy_values'].append(valid_acc)
-
             # early_stopping needs the validation loss to check if it has decresed,
             # and if it has, it will make a checkpoint of the current model
             early_stopping(valid_loss, model)
-            last_epoch += 1
 
             if early_stopping.early_stop:
                 print("Early stopping")
@@ -498,8 +422,9 @@ if __name__ == '__main__':
             scheduler.step()
             # load the last checkpoint with the best model
             model.load_state_dict(torch.load('checkpoint.pt'))
-        
+
         cv += valid_loss / fold.n_splits
 
+    print('cv {}'.format(cv))
     TestDataLoader = make_test_dataset()
     eval(model, TestDataLoader)
