@@ -82,11 +82,11 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 PARAMS = {
     'valid_size': 0.2,
     'batch_size': 64,
-    'epochs': 100,
+    'epochs': 10,
     'lr': 0.001,
     'valid_batch_size': 256,
     'test_batch_size': 256,
-    'patience': 20
+    'patience': 7
 }
 
 
