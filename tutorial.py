@@ -519,7 +519,7 @@ for x, _ in test_dataloader:
 
 # In[24]:
 
-
+print(type(predictions))
 sample_submission_df[TARGET] = predictions
 #print(sample_submission_df)
 
@@ -538,10 +538,10 @@ FileLink('submission.csv')
 # In[26]:
 
 #sns.countplot(sample_submission_df[TARGET])
-sns.countplot(x=TARGET,data=sample_submission_df)
-plt.title('test prediction label distribution')
+#sns.countplot(x=TARGET,data=sample_submission_df)
+#plt.title('test prediction label distribution')
 # plt.show()
-plt.savefig('test_prediction_label_distribution.jpg')
+#plt.savefig('test_prediction_label_distribution.jpg')
 
 
 # In[27]:

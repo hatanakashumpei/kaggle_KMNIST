@@ -14,6 +14,7 @@ import os
 import random
 
 import numpy as np
+from numpy.core.fromnumeric import amax
 import pandas as pd
 import cv2
 
@@ -43,6 +44,7 @@ from pytorch_lightning.core.decorators import auto_move_data
 # import EarlyStopping
 import early_stopping_pytorch
 
+import statistics
 
 def seed_everything(seed=42):
     """seedを固定させる
@@ -83,11 +85,12 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 PARAMS = {
     'valid_size': 0.2,
     'batch_size': 64,
-    'epochs': 20,
+    'epochs': 30,
     'lr': 0.001,
     'valid_batch_size': 256,
     'test_batch_size': 256,
-    'patience': 7
+    'patience': 5,
+    'n-fold': 5
 }
 
 
@@ -154,7 +157,6 @@ class ResNetKMNIST(nn.Module):
 
 def split_train_dataset(input_train_df):
     """訓練データをtrainとvalidに分割する
-    K-Foldを用いる(https://naokiwifruit.com/2019/12/10/how-to-select-fold-cross-validation/)
 
     Returns:
         df: train_df, valid_df
@@ -209,6 +211,7 @@ def make_train_dataset(train_df, valid_df):
 
 def make_kflod_train_dataset(train_df):
     """KFoldするためのtrainDatasetを作成する
+    参考：https://naokiwifruit.com/2019/12/10/how-to-select-fold-cross-validation/
     """
     transform = transforms.Compose([
                     transforms.ToTensor(),
@@ -312,39 +315,54 @@ def valid(model, valid_loader):
     return model, np.mean(valid_loss_list), np.mean(valid_accuracy_list)
 
 
-def eval(model, test_loader):
+def eval(models, test_loader):
     """
     testデータの予測
     """
     print("========evaluate========")
-    model.load_state_dict(torch.load('checkpoint.pt'))
-    model.eval()
-    predictions = []
+    all_predictions = np.zeros((len(sample_submission_df), 10))
+    # それぞれのfoldで学習させたモデルで評価しその平均をとる
+    for fold_idx in range(PARAMS['n-fold']):
+        model = ResNetKMNIST().to(DEVICE)
+        model.eval()
+        model.load_state_dict(torch.load(models[fold_idx]))
+        predictions = []
 
-    for x, _ in test_loader:
-        x = x.to(dtype=torch.float32, device=DEVICE)
+        for x, _ in test_loader:
+            x = x.to(dtype=torch.float32, device=DEVICE)
 
-        with torch.no_grad():
-            y_pred = model(x)
-            y_pred = torch.argmax(y_pred, axis=1).cpu().numpy()
-            y_pred = y_pred.tolist()
-
-        predictions += y_pred
+            with torch.no_grad():
+                y_pred = model(x)
+                predictions.append(torch.argmax(y_pred).cpu().numpy())
+        
+        # print(predictions)
+        print(len(predictions))
+        print(predictions[0])
+        predictions =  np.concatenate(predictions)
+        # predictions = np.array(predictions)
+        print(type(predictions))
+        all_predictions += predictions / len(models)
 
     # 提出データの作成
-    sample_submission_df[TARGET] = predictions
+    all_predictions = np.argmax(all_predictions, axis=1).tolist()
+    sample_submission_df[TARGET] = all_predictions
 
     sample_submission_df.to_csv('submission.csv', index=False)
     FileLink('submission.csv')
+
     # 予測結果を可視化
     sns.countplot(x=TARGET, data=sample_submission_df)
     plt.title('test prediction label distribution')
     plt.savefig('test_prediction_label_distribution.jpg')
 
-    print("Done")
-
 
 if __name__ == '__main__':
+    sample_submission_df = pd.read_csv(PATH['sample_submission'])
+    TestDataLoader = make_test_dataset()
+    models = ['checkpoint_fold0.pt','checkpoint_fold1.pt','checkpoint_fold2.pt','checkpoint_fold3.pt','checkpoint_fold4.pt']
+    eval(models, TestDataLoader)
+
+
     seed_everything(SEED)
 
     TrainDfBefore = pd.read_csv(PATH['train'])
@@ -357,35 +375,37 @@ if __name__ == '__main__':
     # datasetの作成
     dataset = make_kflod_train_dataset(TrainDfBefore)
 
-    fold = KFold(n_splits=5, shuffle=True, random_state=SEED)
+    fold = KFold(n_splits=PARAMS['n-fold'], shuffle=True, random_state=SEED)
 
     cv = 0
     indexs = fold.split(np.arange(len(TrainDfBefore)))
-    # modelの呼び出し
-    model = ResNetKMNIST().to(DEVICE)
-    # initialize the early_stopping object
-    # early stopping patience; how long to wait
-    # after last time validation loss improved.
-    early_stopping = early_stopping_pytorch.pytorchtools.EarlyStopping(
-                    patience=PARAMS['patience'],
-                    verbose=True
-                    )
+
+    models = []
 
     for fold_idx, (train_idx, valid_idx) in enumerate(indexs):
         print('======================================')
         print('fold {}'.format(fold_idx + 1))
 
+        # modelの呼び出し
+        model = ResNetKMNIST().to(DEVICE)
+        # optimaizerは今回Adamを使用
         optim = Adam(model.parameters(), lr=PARAMS['lr'])
         # LambdaLRを用いて学習率を変化させる
         # [参考](https://katsura-jp.hatenablog.com/entry/2019/01/30/183501)
-        scheduler = LambdaLR(optim, lr_lambda=lambda epoch: 0.95 ** epoch)
+        scheduler = LambdaLR(optim, lr_lambda=lambda epoch: 0.85 ** epoch)
         criterion = nn.CrossEntropyLoss()
 
         train_loader = DataLoader(Subset(dataset, train_idx), shuffle=True, batch_size=PARAMS['batch_size'])
         valid_loader = DataLoader(Subset(dataset, valid_idx), shuffle=True, batch_size=PARAMS['valid_batch_size'])
 
-        early_stopping.counter = 0
-        early_stopping.early_stop = False
+        # initialize the early_stopping object
+        # early stopping patience; how long to wait
+        # after last time validation loss improved.
+        early_stopping = early_stopping_pytorch.pytorchtools.EarlyStopping(
+                        patience=PARAMS['patience'],
+                        verbose=True
+                        )
+
         for epoch_idx in range(PARAMS['epochs']):
             # epochループを回す
             start_time = time.time()
@@ -424,7 +444,12 @@ if __name__ == '__main__':
             model.load_state_dict(torch.load('checkpoint.pt'))
 
         cv += valid_loss / fold.n_splits
+        # save model for each fold index
+        modelfilename = 'checkpoint_fold_{}.pt'.format(fold_idx + 1)
+        print('save model for {}'.format(modelfilename))
+        torch.save(model.state_dict(), modelfilename)
+        models.append(modelfilename)
 
     print('cv {}'.format(cv))
     TestDataLoader = make_test_dataset()
-    eval(model, TestDataLoader)
+    eval(models, TestDataLoader)
