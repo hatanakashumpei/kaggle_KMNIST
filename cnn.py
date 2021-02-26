@@ -21,7 +21,7 @@ import cv2
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
@@ -44,7 +44,6 @@ from pytorch_lightning.core.decorators import auto_move_data
 # import EarlyStopping
 import early_stopping_pytorch
 
-import statistics
 
 def seed_everything(seed=42):
     """seedを固定させる
@@ -85,7 +84,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 PARAMS = {
     'valid_size': 0.2,
     'batch_size': 64,
-    'epochs': 30,
+    'epochs': 50,
     'lr': 0.001,
     'valid_batch_size': 256,
     'test_batch_size': 256,
@@ -333,14 +332,9 @@ def eval(models, test_loader):
 
             with torch.no_grad():
                 y_pred = model(x)
-                predictions.append(torch.argmax(y_pred).cpu().numpy())
+                predictions.append(y_pred.cpu().numpy())
         
-        # print(predictions)
-        print(len(predictions))
-        print(predictions[0])
         predictions =  np.concatenate(predictions)
-        # predictions = np.array(predictions)
-        print(type(predictions))
         all_predictions += predictions / len(models)
 
     # 提出データの作成
@@ -357,12 +351,6 @@ def eval(models, test_loader):
 
 
 if __name__ == '__main__':
-    sample_submission_df = pd.read_csv(PATH['sample_submission'])
-    TestDataLoader = make_test_dataset()
-    models = ['checkpoint_fold0.pt','checkpoint_fold1.pt','checkpoint_fold2.pt','checkpoint_fold3.pt','checkpoint_fold4.pt']
-    eval(models, TestDataLoader)
-
-
     seed_everything(SEED)
 
     TrainDfBefore = pd.read_csv(PATH['train'])
@@ -375,10 +363,10 @@ if __name__ == '__main__':
     # datasetの作成
     dataset = make_kflod_train_dataset(TrainDfBefore)
 
-    fold = KFold(n_splits=PARAMS['n-fold'], shuffle=True, random_state=SEED)
+    fold = StratifiedKFold(n_splits=PARAMS['n-fold'], random_state=SEED, shuffle=True)
 
     cv = 0
-    indexs = fold.split(np.arange(len(TrainDfBefore)))
+    indexs = fold.split(TrainDfBefore[ID], TrainDfBefore[TARGET])
 
     models = []
 
@@ -396,7 +384,7 @@ if __name__ == '__main__':
         criterion = nn.CrossEntropyLoss()
 
         train_loader = DataLoader(Subset(dataset, train_idx), shuffle=True, batch_size=PARAMS['batch_size'])
-        valid_loader = DataLoader(Subset(dataset, valid_idx), shuffle=True, batch_size=PARAMS['valid_batch_size'])
+        valid_loader = DataLoader(Subset(dataset, valid_idx), shuffle=False, batch_size=PARAMS['valid_batch_size'])
 
         # initialize the early_stopping object
         # early stopping patience; how long to wait
