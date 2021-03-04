@@ -17,6 +17,7 @@ import numpy as np
 from numpy.core.fromnumeric import amax
 import pandas as pd
 import cv2
+from PIL import Image
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -24,6 +25,9 @@ import seaborn as sns
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+import torchvision
+
+from model.smooth_cross_entropy import smooth_crossentropy
 
 import torch
 import torch.nn as nn
@@ -37,12 +41,16 @@ from tqdm import tqdm
 
 from IPython.display import FileLink
 
-from torchvision.models import resnet18
+from torchvision.models import resnet18, resnet50
 # import pytorch_lightning as pl
 from pytorch_lightning.core.decorators import auto_move_data
 
 # import EarlyStopping
 import early_stopping_pytorch
+
+# import SAM optim
+# https://github.com/davda54/sam
+from sam_main.sam import SAM
 
 
 def seed_everything(seed=42):
@@ -88,7 +96,7 @@ PARAMS = {
     'lr': 0.001,
     'valid_batch_size': 256,
     'test_batch_size': 256,
-    'patience': 5,
+    'patience': 10,
     'n-fold': 5
 }
 
@@ -122,8 +130,12 @@ class KMNISTDataset(Dataset):
         fname = self.fname_list[idx]
         label = self.label_list[idx]
 
-        image = cv2.imread(os.path.join(self.image_dir, fname))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        #image = cv2.imread(os.path.join(self.image_dir, fname))
+        #image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        image = Image.open(os.path.join(self.image_dir, fname))
+        image = torchvision.transforms.functional.to_grayscale(image)
+        
         if self.transform is not None:
             image = self.transform(image)
         # __getitem__でデータを返す前にtransformでデータに前処理をしてから返すことがポイント
@@ -147,6 +159,7 @@ class ResNetKMNIST(nn.Module):
                                 padding=(3, 3),
                                 bias=False
                             )
+        # self.model.fc = nn.Linear(2048, 10, bias=True)
         self.loss = nn.CrossEntropyLoss()
 
     @auto_move_data
@@ -213,6 +226,8 @@ def make_kflod_train_dataset(train_df):
     参考：https://naokiwifruit.com/2019/12/10/how-to-select-fold-cross-validation/
     """
     transform = transforms.Compose([
+                    # transforms.Resize(50),
+                    # transforms.Pad(padding=3, padding_mode='edge'),
                     transforms.ToTensor(),
                     # numpy.arrayで読み込まれた画像をPyTorch用のTensorに変換します．
                     transforms.Normalize((0.5, ), (0.5, ))
@@ -275,16 +290,23 @@ def train(model, train_loader):
         # 先ほど定義したdataloaderから画像とラベルのセットのdataを取得
         x = x.to(dtype=torch.float32, device=DEVICE)
         y = y.to(dtype=torch.long, device=DEVICE)
-        # pytorchでは通常誤差逆伝播を行う前に毎回勾配をゼロにする必要がある
-        optim.zero_grad()
-        # 順伝播を行う
+
         y_pred = model(x)
-        # lossの定義 今回はcross entropyを用います
+
+        # pytorchでは通常誤差逆伝播を行う前に毎回勾配をゼロにする必要がある
+        optimizer.zero_grad()
+
+        # first forward-backward pass
+        # loss = smooth_crossentropy(y_pred, y)
         loss = criterion(y_pred, y)
-        # 誤差逆伝播を行なってモデルを修正します(誤差逆伝播についてはhttp://hokuts.com/2016/05/29/bp1/)
-        loss.backward()  # 逆伝播の計算
-        # 逆伝播の結果からモデルを更新
-        optim.step()
+        loss.backward()
+        optimizer.first_step(zero_grad=True)
+  
+        # second forward-backward pass
+        # smooth_crossentropy(model(x), y).mean().backward()
+        y_pred = model(x)
+        criterion(y_pred, y).backward()
+        optimizer.second_step(zero_grad=True)
 
         train_loss_list.append(loss.item())
         train_accuracy_list.append(accuracy_score_torch(y_pred, y))
@@ -306,9 +328,10 @@ def valid(model, valid_loader):
 
         with torch.no_grad():
             y_pred = model(x)
+            # loss = smooth_crossentropy(y_pred, y)
             loss = criterion(y_pred, y)
 
-        valid_loss_list.append(loss.item())
+        valid_loss_list.append(loss.mean().item())
         valid_accuracy_list.append(accuracy_score_torch(y_pred, y))
 
     return model, np.mean(valid_loss_list), np.mean(valid_accuracy_list)
@@ -376,11 +399,18 @@ if __name__ == '__main__':
 
         # modelの呼び出し
         model = ResNetKMNIST().to(DEVICE)
+
         # optimaizerは今回Adamを使用
-        optim = Adam(model.parameters(), lr=PARAMS['lr'])
+        # optim = Adam(model.parameters(), lr=PARAMS['lr'])
+
+        # SAM optimizerの使用
+        base_optimizer = torch.optim.SGD
+        optimizer = SAM(model.parameters(), base_optimizer, lr=0.001, momentum=0.9)
+
         # LambdaLRを用いて学習率を変化させる
         # [参考](https://katsura-jp.hatenablog.com/entry/2019/01/30/183501)
-        scheduler = LambdaLR(optim, lr_lambda=lambda epoch: 0.85 ** epoch)
+        # scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: 0.85 ** epoch)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='min',factor=0.2,patience=1) 
         criterion = nn.CrossEntropyLoss()
 
         train_loader = DataLoader(Subset(dataset, train_idx), shuffle=True, batch_size=PARAMS['batch_size'])
@@ -427,7 +457,9 @@ if __name__ == '__main__':
                 break
 
             # 学習率を更新
-            scheduler.step()
+            # validation lossが下がってなかったら減衰
+            scheduler.step(valid_loss)
+
             # load the last checkpoint with the best model
             model.load_state_dict(torch.load('checkpoint.pt'))
 
