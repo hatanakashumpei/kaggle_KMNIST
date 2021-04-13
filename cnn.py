@@ -16,6 +16,10 @@ import random
 import numpy as np
 from numpy.core.fromnumeric import amax
 import pandas as pd
+import sys
+ROS_PATH = '/opt/ros/melodic/lib/python2.7/dist-packages'
+if ROS_PATH in sys.path:
+    sys.path.remove(ROS_PATH)
 import cv2
 from PIL import Image
 
