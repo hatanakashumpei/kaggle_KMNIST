@@ -23,3 +23,10 @@ KMNISTのKaggleコンペ
 - opencv-python:4.5.1.48
 - sklearn:0.0
 - Ipython:7.16.1
+
+## How to Use
+
+1. `git clone `
+2. `cd kaggle_KMINST`
+3. `git clone https://github.com/Bjarten/early-stopping-pytorch.git`
+4. `python cnn.py`
